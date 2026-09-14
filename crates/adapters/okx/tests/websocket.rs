@@ -71,6 +71,7 @@ struct TestServerState {
     connection_count: Arc<tokio::sync::Mutex<usize>>,
     login_count: Arc<tokio::sync::Mutex<usize>>,
     subscriptions: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    subscription_messages: Arc<tokio::sync::Mutex<Vec<Value>>>,
     unsubscriptions: Arc<tokio::sync::Mutex<Vec<Value>>>,
     order_messages: Arc<tokio::sync::Mutex<Vec<Value>>>,
     drop_next_connection: Arc<AtomicBool>,
@@ -342,6 +343,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                     }
 
                     if payload.get("op") == Some(&json!("subscribe")) {
+                        state
+                            .subscription_messages
+                            .lock()
+                            .await
+                            .push(payload.clone());
                         if let Some(args) = payload.get("args").and_then(|value| value.as_array())
                             && let Some(first) = args.first()
                         {
@@ -1178,6 +1184,61 @@ async fn test_trades_subscription_flow() {
 }
 
 #[tokio::test]
+async fn test_subscribe_many_sends_one_operation_with_all_args() {
+    use nautilus_okx::websocket::{enums::OKXWsChannel, messages::OKXSubscriptionArg};
+
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws");
+
+    let mut client = connect_client(&ws_url).await;
+    client.connect().await.expect("connect failed");
+    client
+        .wait_until_active(5.0)
+        .await
+        .expect("client inactive");
+
+    let args = vec![
+        OKXSubscriptionArg {
+            channel: OKXWsChannel::Tickers,
+            inst_type: Some(OKXInstrumentType::Option),
+            inst_family: None,
+            inst_id: Some(Ustr::from("BTC-USD_UM-260914-68000-C")),
+        },
+        OKXSubscriptionArg {
+            channel: OKXWsChannel::OptionSummary,
+            inst_type: None,
+            inst_family: Some(Ustr::from("BTC-USD_UM")),
+            inst_id: None,
+        },
+    ];
+
+    client
+        .subscribe_many(args)
+        .await
+        .expect("batched subscribe failed");
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { !state.subscription_messages.lock().await.is_empty() }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let messages = state.subscription_messages.lock().await;
+    assert_eq!(messages.len(), 1, "expected one subscribe operation");
+    let sent_args = messages[0]["args"]
+        .as_array()
+        .expect("subscribe args should be an array");
+    assert_eq!(sent_args.len(), 2);
+    assert_eq!(sent_args[0]["instId"], "BTC-USD_UM-260914-68000-C");
+    assert!(sent_args[0].get("sprdId").is_none());
+    assert_eq!(sent_args[1]["instFamily"], "BTC-USD_UM");
+}
+
+#[tokio::test]
 async fn test_reauth_and_resubscribe_after_disconnect() {
     let state = Arc::new(TestServerState::default());
     state.drop_next_connection.store(true, Ordering::Relaxed);
@@ -1212,6 +1273,77 @@ async fn test_reauth_and_resubscribe_after_disconnect() {
         Duration::from_secs(2),
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_reconnect_replays_subscriptions_in_configured_chunks() {
+    use nautilus_okx::websocket::{
+        client::OKX_WS_SUBSCRIPTION_MAX_BYTES, enums::OKXWsChannel, messages::OKXSubscriptionArg,
+    };
+
+    let state = Arc::new(TestServerState::default());
+    state.drop_next_connection.store(true, Ordering::Relaxed);
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws");
+
+    let mut client = connect_client(&ws_url).await;
+    client
+        .set_subscription_replay_policy(2, OKX_WS_SUBSCRIPTION_MAX_BYTES, Duration::ZERO)
+        .expect("valid replay policy");
+    client.connect().await.expect("connect failed");
+    client
+        .wait_until_active(5.0)
+        .await
+        .expect("client inactive");
+
+    let symbol = Ustr::from("BTC-USD_UM-260914-68000-C");
+    let args = [
+        OKXWsChannel::Tickers,
+        OKXWsChannel::BboTbt,
+        OKXWsChannel::Trades,
+        OKXWsChannel::Books5,
+    ]
+    .into_iter()
+    .map(|channel| OKXSubscriptionArg {
+        channel,
+        inst_type: None,
+        inst_family: None,
+        inst_id: Some(symbol),
+    })
+    .chain(std::iter::once(OKXSubscriptionArg {
+        channel: OKXWsChannel::OptionSummary,
+        inst_type: None,
+        inst_family: Some(Ustr::from("BTC-USD_UM")),
+        inst_id: None,
+    }))
+    .collect::<Vec<_>>();
+
+    client
+        .subscribe_many(args)
+        .await
+        .expect("initial batched subscribe failed");
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { state.subscription_messages.lock().await.len() >= 4 }
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+
+    let messages = state.subscription_messages.lock().await;
+    assert_eq!(messages[0]["args"].as_array().map(Vec::len), Some(5));
+    let replay_lengths = messages[1..]
+        .iter()
+        .map(|message| {
+            message["args"]
+                .as_array()
+                .expect("replay args should be an array")
+                .len()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replay_lengths, vec![2, 2, 1]);
 }
 
 #[tokio::test]

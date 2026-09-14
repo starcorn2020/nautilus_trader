@@ -65,12 +65,12 @@ use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use super::{
-    enums::OKXWsChannel,
+    enums::{OKXWsChannel, OKXWsOperation},
     error::OKXWsError,
     handler::{HandlerCommand, OKXWsFeedHandler},
     messages::{
-        OKXAuthentication, OKXAuthenticationArg, OKXSubscriptionArg, OKXWsMessage, OKXWsRequest,
-        WsAmendOrderParamsBuilder, WsAttachAlgoOrdParams, WsCancelOrderParamsBuilder,
+        OKXAuthentication, OKXAuthenticationArg, OKXSubscription, OKXSubscriptionArg, OKXWsMessage,
+        OKXWsRequest, WsAmendOrderParamsBuilder, WsAttachAlgoOrdParams, WsCancelOrderParamsBuilder,
         WsMassCancelParams, WsPostAlgoOrderParamsBuilder, WsPostOrderParamsBuilder,
     },
     subscription::topic_from_subscription_arg,
@@ -105,6 +105,108 @@ pub static OKX_WS_CONNECTION_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
 /// 480 per hour = 8 per minute, but we use per-hour for accurate limiting.
 pub static OKX_WS_SUBSCRIPTION_QUOTA: LazyLock<Quota> =
     LazyLock::new(|| Quota::per_hour(NonZeroU32::new(480).expect("non-zero")));
+
+/// Maximum encoded size of an OKX WebSocket subscribe operation.
+pub const OKX_WS_SUBSCRIPTION_MAX_BYTES: usize = 64 * 1024;
+
+/// Splits subscription arguments without exceeding either the configured count
+/// or the encoded OKX operation size.
+///
+/// # Errors
+///
+/// Returns an error for a zero bound, failed serialization, or an argument
+/// which cannot fit in one operation by itself.
+pub fn chunk_subscription_args(
+    args: &[OKXSubscriptionArg],
+    max_count: usize,
+    max_bytes: usize,
+) -> Result<Vec<Vec<OKXSubscriptionArg>>, OKXWsError> {
+    if max_count == 0 || max_bytes == 0 {
+        return Err(OKXWsError::ClientError(
+            "subscription chunk count and byte bounds must be positive".to_string(),
+        ));
+    }
+
+    let encoded_len = |candidate: &[OKXSubscriptionArg]| {
+        serde_json::to_vec(&OKXSubscription {
+            op: OKXWsOperation::Subscribe,
+            args: candidate.to_vec(),
+        })
+        .map(|payload| payload.len())
+        .map_err(|error| {
+            OKXWsError::ClientError(format!("Failed to serialize subscription: {error}"))
+        })
+    };
+
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    for arg in args {
+        current.push(arg.clone());
+        if current.len() > max_count || encoded_len(&current)? > max_bytes {
+            let overflow = current.pop().expect("the just-pushed argument exists");
+            if current.is_empty() {
+                return Err(OKXWsError::ClientError(format!(
+                    "one subscription argument exceeds the {max_bytes}-byte operation bound"
+                )));
+            }
+            chunks.push(std::mem::take(&mut current));
+            current.push(overflow);
+            if encoded_len(&current)? > max_bytes {
+                return Err(OKXWsError::ClientError(format!(
+                    "one subscription argument exceeds the {max_bytes}-byte operation bound"
+                )));
+            }
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
+async fn enqueue_subscription_chunks(
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    chunks: Vec<Vec<OKXSubscriptionArg>>,
+    interval: Duration,
+    signal: Arc<AtomicBool>,
+) {
+    let count = chunks.len();
+    for (index, args) in chunks.into_iter().enumerate() {
+        if signal.load(Ordering::Acquire) {
+            return;
+        }
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        if let Err(error) = cmd_tx.send(HandlerCommand::SubscribeAndWait { args, result_tx }) {
+            log::error!("Failed to send resubscribe command: error={error}");
+            return;
+        }
+        match result_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::error!("Failed to send resubscribe operation: error={error}");
+                return;
+            }
+            Err(error) => {
+                log::error!("Resubscribe completion channel closed: error={error}");
+                return;
+            }
+        }
+        if index + 1 < count && !interval.is_zero() {
+            let sleep = tokio::time::sleep(interval);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    () = &mut sleep => break,
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if signal.load(Ordering::Acquire) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Rate limit for single order, cancel, and amend WebSocket operations: 30 requests per second.
 pub static OKX_WS_ORDER_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
@@ -254,6 +356,9 @@ pub struct OKXWebSocketClient {
     /// Optional proxy URL for the WebSocket transport.
     proxy_url: Option<String>,
     cancellation_token: CancellationToken,
+    subscription_replay_chunk_size: usize,
+    subscription_replay_max_bytes: usize,
+    subscription_replay_interval: Duration,
 }
 
 impl Default for OKXWebSocketClient {
@@ -357,6 +462,9 @@ impl OKXWebSocketClient {
             transport_backend,
             proxy_url,
             cancellation_token: CancellationToken::new(),
+            subscription_replay_chunk_size: 1,
+            subscription_replay_max_bytes: OKX_WS_SUBSCRIPTION_MAX_BYTES,
+            subscription_replay_interval: Duration::ZERO,
         })
     }
 
@@ -538,6 +646,28 @@ impl OKXWebSocketClient {
         self.vip_level.store(vip_level as u8, Ordering::Relaxed);
     }
 
+    /// Configures how tracked public subscriptions are replayed after reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either bound is zero.
+    pub fn set_subscription_replay_policy(
+        &mut self,
+        chunk_size: usize,
+        max_payload_bytes: usize,
+        interval: Duration,
+    ) -> Result<(), OKXWsError> {
+        if chunk_size == 0 || max_payload_bytes == 0 {
+            return Err(OKXWsError::ClientError(
+                "subscription replay chunk count and byte bounds must be positive".to_string(),
+            ));
+        }
+        self.subscription_replay_chunk_size = chunk_size;
+        self.subscription_replay_max_bytes = max_payload_bytes;
+        self.subscription_replay_interval = interval;
+        Ok(())
+    }
+
     /// Gets the current VIP level.
     pub fn vip_level(&self) -> OKXVipLevel {
         let level = self.vip_level.load(Ordering::Relaxed);
@@ -658,6 +788,9 @@ impl OKXWebSocketClient {
             let subscriptions_inst_type = self.subscriptions_inst_type.clone();
             let subscriptions_inst_family = self.subscriptions_inst_family.clone();
             let subscriptions_inst_id = self.subscriptions_inst_id.clone();
+            let subscription_replay_chunk_size = self.subscription_replay_chunk_size;
+            let subscription_replay_max_bytes = self.subscription_replay_max_bytes;
+            let subscription_replay_interval = self.subscription_replay_interval;
             let mut has_reconnected = false;
 
             async move {
@@ -670,67 +803,71 @@ impl OKXWebSocketClient {
                     subscriptions_state.clone(),
                 );
 
-                // Helper closure to resubscribe all tracked subscriptions after reconnection
+                // Rebuild all tracked arguments. Sending happens in a separate task so
+                // pacing does not stop this handler from reading inbound frames.
                 let resubscribe_all = || {
+                    let mut args = Vec::new();
                     for entry in subscriptions_inst_id.iter() {
                         let (channel, inst_ids) = entry.pair();
                         for inst_id in inst_ids {
-                            let arg = OKXSubscriptionArg {
+                            args.push(OKXSubscriptionArg {
                                 channel: channel.clone(),
                                 inst_type: None,
                                 inst_family: None,
                                 inst_id: Some(*inst_id),
-                            };
-
-                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args: vec![arg] }) {
-                                log::error!("Failed to send resubscribe command: error={e}");
-                            }
+                            });
                         }
                     }
 
                     for entry in subscriptions_bare.iter() {
                         let channel = entry.key();
-                        let arg = OKXSubscriptionArg {
+                        args.push(OKXSubscriptionArg {
                             channel: channel.clone(),
                             inst_type: None,
                             inst_family: None,
                             inst_id: None,
-                        };
-
-                        if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args: vec![arg] }) {
-                            log::error!("Failed to send resubscribe command: error={e}");
-                        }
+                        });
                     }
 
                     for entry in subscriptions_inst_type.iter() {
                         let (channel, inst_types) = entry.pair();
                         for inst_type in inst_types {
-                            let arg = OKXSubscriptionArg {
+                            args.push(OKXSubscriptionArg {
                                 channel: channel.clone(),
                                 inst_type: Some(*inst_type),
                                 inst_family: None,
                                 inst_id: None,
-                            };
-
-                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args: vec![arg] }) {
-                                log::error!("Failed to send resubscribe command: error={e}");
-                            }
+                            });
                         }
                     }
 
                     for entry in subscriptions_inst_family.iter() {
                         let (channel, inst_families) = entry.pair();
                         for inst_family in inst_families {
-                            let arg = OKXSubscriptionArg {
+                            args.push(OKXSubscriptionArg {
                                 channel: channel.clone(),
                                 inst_type: None,
                                 inst_family: Some(*inst_family),
                                 inst_id: None,
-                            };
+                            });
+                        }
+                    }
 
-                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args: vec![arg] }) {
-                                log::error!("Failed to send resubscribe command: error={e}");
-                            }
+                    match chunk_subscription_args(
+                        &args,
+                        subscription_replay_chunk_size,
+                        subscription_replay_max_bytes,
+                    ) {
+                        Ok(chunks) => {
+                            drop(get_runtime().spawn(enqueue_subscription_chunks(
+                                cmd_tx_for_reconnect.clone(),
+                                chunks,
+                                subscription_replay_interval,
+                                signal.clone(),
+                            )));
+                        }
+                        Err(error) => {
+                            log::error!("Failed to chunk resubscribe arguments: error={error}");
                         }
                     }
                 };
@@ -1043,7 +1180,13 @@ impl OKXWebSocketClient {
                 OKXWsError::ClientError(format!("Failed to send subscribe command: {e}"))
             })?;
 
-        for arg in &args {
+        self.track_subscriptions(&args);
+
+        Ok(())
+    }
+
+    fn track_subscriptions(&self, args: &[OKXSubscriptionArg]) {
+        for arg in args {
             let topic = topic_from_subscription_arg(arg);
             self.subscriptions_state.mark_subscribe(&topic);
 
@@ -1073,7 +1216,33 @@ impl OKXWebSocketClient {
                 }
             }
         }
+    }
 
+    /// Subscribes to multiple public topics in one OKX operation.
+    ///
+    /// The caller owns count, payload-size, and pacing policy. Local tracked
+    /// state is updated exactly as it is for the single-topic helpers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command cannot be queued or the transport send
+    /// fails. Venue acknowledgement remains asynchronous.
+    pub async fn subscribe_many(&self, args: Vec<OKXSubscriptionArg>) -> Result<(), OKXWsError> {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .read()
+            .await
+            .send(HandlerCommand::SubscribeAndWait {
+                args: args.clone(),
+                result_tx,
+            })
+            .map_err(|error| {
+                OKXWsError::ClientError(format!("Failed to send subscribe command: {error}"))
+            })?;
+        result_rx.await.map_err(|error| {
+            OKXWsError::ClientError(format!("Subscription completion channel closed: {error}"))
+        })??;
+        self.track_subscriptions(&args);
         Ok(())
     }
 

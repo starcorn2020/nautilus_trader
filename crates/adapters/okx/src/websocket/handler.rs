@@ -70,6 +70,11 @@ pub enum HandlerCommand {
     Authenticate { payload: String },
     /// Subscribe to the given channels.
     Subscribe { args: Vec<OKXSubscriptionArg> },
+    /// Subscribe and report when the transport send has completed.
+    SubscribeAndWait {
+        args: Vec<OKXSubscriptionArg>,
+        result_tx: tokio::sync::oneshot::Sender<Result<(), OKXWsError>>,
+    },
     /// Unsubscribe from the given channels.
     Unsubscribe { args: Vec<OKXSubscriptionArg> },
     /// Send a pre-serialized payload (used for order operations).
@@ -198,6 +203,15 @@ impl OKXWsFeedHandler {
                         HandlerCommand::Subscribe { args } => {
                             if let Err(e) = self.handle_subscribe(args).await {
                                 log::error!("Failed to handle subscribe command: error={e}");
+                            }
+                        }
+                        HandlerCommand::SubscribeAndWait { args, result_tx } => {
+                            let result = self
+                                .handle_subscribe(args)
+                                .await
+                                .map_err(|error| OKXWsError::ClientError(error.to_string()));
+                            if result_tx.send(result).is_err() {
+                                log::debug!("Subscribe completion receiver was dropped");
                             }
                         }
                         HandlerCommand::Unsubscribe { args } => {
