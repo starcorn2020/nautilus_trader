@@ -56,12 +56,12 @@ features = ["examples", "high-precision"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-nautilus-common = { workspace = true, features = ["live"] }
-nautilus-core = { workspace = true }
-nautilus-live = { workspace = true }
-nautilus-model = { workspace = true }
-nautilus-network = { workspace = true }
-nautilus-system = { workspace = true, optional = true }
+nautilus-common = { version = "0.62.0", features = ["live"] }
+nautilus-core = "0.62.0"
+nautilus-live = { version = "0.62.0", default-features = false }
+nautilus-model = "0.62.0"
+nautilus-network = "0.62.0"
+nautilus-system = { version = "0.62.0", optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
