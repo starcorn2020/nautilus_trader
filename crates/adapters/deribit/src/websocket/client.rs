@@ -77,6 +77,21 @@ use crate::common::{
 /// Authentication timeout in seconds.
 const AUTHENTICATION_TIMEOUT_SECS: u64 = 30;
 
+fn enqueue_subscription_chunks(
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    channels: &[String],
+    chunk_size: usize,
+) {
+    for chunk in channels.chunks(chunk_size) {
+        if let Err(e) = cmd_tx.send(HandlerCommand::Subscribe {
+            channels: chunk.to_vec(),
+        }) {
+            log::error!("Failed to enqueue resubscribe command: error={e}");
+            return;
+        }
+    }
+}
+
 /// WebSocket client for connecting to Deribit.
 #[derive(Clone)]
 #[cfg_attr(
@@ -111,6 +126,7 @@ pub struct DeribitWebSocketClient {
     subscribe_errors: Arc<Mutex<Vec<String>>>,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
+    subscription_replay_chunk_size: usize,
 }
 
 impl Debug for DeribitWebSocketClient {
@@ -221,6 +237,7 @@ impl DeribitWebSocketClient {
             subscribe_errors: Arc::new(Mutex::new(Vec::new())),
             transport_backend,
             proxy_url,
+            subscription_replay_chunk_size: usize::MAX,
         })
     }
 
@@ -498,6 +515,21 @@ impl DeribitWebSocketClient {
         self.option_greeks_subs.insert(instrument_id);
     }
 
+    /// Bounds each subscribe request replayed after a reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `chunk_size` is zero.
+    pub fn set_subscription_replay_chunk_size(&mut self, chunk_size: usize) -> DeribitWsResult<()> {
+        if chunk_size == 0 {
+            return Err(DeribitWsError::ClientError(
+                "subscription replay chunk size must be positive".to_string(),
+            ));
+        }
+        self.subscription_replay_chunk_size = chunk_size;
+        Ok(())
+    }
+
     /// Unregisters an instrument from option greeks emission.
     pub fn remove_option_greeks_sub(&self, instrument_id: &InstrumentId) {
         self.option_greeks_subs.remove(instrument_id);
@@ -626,6 +658,7 @@ impl DeribitWebSocketClient {
         let auth_tracker = self.auth_tracker.clone();
         let auth_state = self.auth_state.clone();
         let heartbeat_interval = self.heartbeat_interval;
+        let subscription_replay_chunk_size = self.subscription_replay_chunk_size;
 
         let task_handle = get_runtime().spawn(async move {
             const MAX_REAUTH_ATTEMPTS: u32 = 3;
@@ -678,9 +711,11 @@ impl DeribitWebSocketClient {
                                 send_auth_request(cred, previous_scope, &cmd_tx);
                             } else {
                                 // No credentials - resubscribe immediately
-                                if !channels.is_empty() {
-                                    let _ = cmd_tx.send(HandlerCommand::Subscribe { channels });
-                                }
+                                enqueue_subscription_chunks(
+                                    &cmd_tx,
+                                    &channels,
+                                    subscription_replay_chunk_size,
+                                );
                             }
                         }
                         NautilusWsMessage::Authenticated(result) => {
@@ -710,9 +745,11 @@ impl DeribitWebSocketClient {
 
                                 let channels = subscriptions_state.all_topics();
 
-                                if !channels.is_empty() {
-                                    let _ = cmd_tx.send(HandlerCommand::Subscribe { channels });
-                                }
+                                enqueue_subscription_chunks(
+                                    &cmd_tx,
+                                    &channels,
+                                    subscription_replay_chunk_size,
+                                );
                             } else {
                                 log::debug!(
                                     "Auth state stored: scope={}, expires_in={}s",
@@ -1762,5 +1799,26 @@ impl DeribitWebSocketClient {
             .map_err(|e| DeribitWsError::Send(e.to_string()))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn reconnect_replay_respects_the_configured_chunk_size() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let channels = (0..5).map(|n| format!("channel-{n}")).collect::<Vec<_>>();
+
+        enqueue_subscription_chunks(&tx, &channels, 2);
+
+        let mut chunk_sizes = Vec::new();
+        while let Ok(HandlerCommand::Subscribe { channels }) = rx.try_recv() {
+            chunk_sizes.push(channels.len());
+        }
+        assert_eq!(chunk_sizes, [2, 2, 1]);
     }
 }
