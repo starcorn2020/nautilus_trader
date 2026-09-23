@@ -77,17 +77,29 @@ use crate::common::{
 /// Authentication timeout in seconds.
 const AUTHENTICATION_TIMEOUT_SECS: u64 = 30;
 
-fn enqueue_subscription_chunks(
-    cmd_tx: &tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
-    channels: &[String],
+async fn enqueue_subscription_chunks(
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<HandlerCommand>,
+    channels: Vec<String>,
     chunk_size: usize,
+    interval: Duration,
+    cancel: CancellationToken,
 ) {
-    for chunk in channels.chunks(chunk_size) {
+    let count = channels.len().div_ceil(chunk_size);
+    for (index, chunk) in channels.chunks(chunk_size).enumerate() {
+        if cancel.is_cancelled() {
+            return;
+        }
         if let Err(e) = cmd_tx.send(HandlerCommand::Subscribe {
             channels: chunk.to_vec(),
         }) {
             log::error!("Failed to enqueue resubscribe command: error={e}");
             return;
+        }
+        if index + 1 < count && !interval.is_zero() {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
+            }
         }
     }
 }
@@ -127,6 +139,7 @@ pub struct DeribitWebSocketClient {
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
     subscription_replay_chunk_size: usize,
+    subscription_replay_interval: Duration,
 }
 
 impl Debug for DeribitWebSocketClient {
@@ -238,6 +251,7 @@ impl DeribitWebSocketClient {
             transport_backend,
             proxy_url,
             subscription_replay_chunk_size: usize::MAX,
+            subscription_replay_interval: Duration::ZERO,
         })
     }
 
@@ -515,18 +529,23 @@ impl DeribitWebSocketClient {
         self.option_greeks_subs.insert(instrument_id);
     }
 
-    /// Bounds each subscribe request replayed after a reconnect.
+    /// Configures the chunk size and interval used to replay subscriptions after reconnecting.
     ///
     /// # Errors
     ///
     /// Returns an error when `chunk_size` is zero.
-    pub fn set_subscription_replay_chunk_size(&mut self, chunk_size: usize) -> DeribitWsResult<()> {
+    pub fn set_subscription_replay_policy(
+        &mut self,
+        chunk_size: usize,
+        interval: Duration,
+    ) -> DeribitWsResult<()> {
         if chunk_size == 0 {
             return Err(DeribitWsError::ClientError(
                 "subscription replay chunk size must be positive".to_string(),
             ));
         }
         self.subscription_replay_chunk_size = chunk_size;
+        self.subscription_replay_interval = interval;
         Ok(())
     }
 
@@ -659,6 +678,7 @@ impl DeribitWebSocketClient {
         let auth_state = self.auth_state.clone();
         let heartbeat_interval = self.heartbeat_interval;
         let subscription_replay_chunk_size = self.subscription_replay_chunk_size;
+        let subscription_replay_interval = self.subscription_replay_interval;
 
         let task_handle = get_runtime().spawn(async move {
             const MAX_REAUTH_ATTEMPTS: u32 = 3;
@@ -668,6 +688,7 @@ impl DeribitWebSocketClient {
 
             let mut refresh_cancel = CancellationToken::new();
             let mut retry_cancel = CancellationToken::new();
+            let mut replay_cancel = CancellationToken::new();
 
             loop {
                 match handler.next().await {
@@ -680,6 +701,8 @@ impl DeribitWebSocketClient {
                             refresh_cancel = CancellationToken::new();
                             retry_cancel.cancel();
                             retry_cancel = CancellationToken::new();
+                            replay_cancel.cancel();
+                            replay_cancel = CancellationToken::new();
 
                             // Deribit scopes `set_heartbeat` to the connection, so the replacement
                             // starts with heartbeats off and the venue sends no further
@@ -710,12 +733,14 @@ impl DeribitWebSocketClient {
 
                                 send_auth_request(cred, previous_scope, &cmd_tx);
                             } else {
-                                // No credentials - resubscribe immediately
-                                enqueue_subscription_chunks(
-                                    &cmd_tx,
-                                    &channels,
+                                // Pace replay in a separate task so the handler keeps reading frames.
+                                drop(get_runtime().spawn(enqueue_subscription_chunks(
+                                    cmd_tx.clone(),
+                                    channels,
                                     subscription_replay_chunk_size,
-                                );
+                                    subscription_replay_interval,
+                                    replay_cancel.clone(),
+                                )));
                             }
                         }
                         NautilusWsMessage::Authenticated(result) => {
@@ -745,11 +770,13 @@ impl DeribitWebSocketClient {
 
                                 let channels = subscriptions_state.all_topics();
 
-                                enqueue_subscription_chunks(
-                                    &cmd_tx,
-                                    &channels,
+                                drop(get_runtime().spawn(enqueue_subscription_chunks(
+                                    cmd_tx.clone(),
+                                    channels,
                                     subscription_replay_chunk_size,
-                                );
+                                    subscription_replay_interval,
+                                    replay_cancel.clone(),
+                                )));
                             } else {
                                 log::debug!(
                                     "Auth state stored: scope={}, expires_in={}s",
@@ -814,11 +841,13 @@ impl DeribitWebSocketClient {
                                     }
                                 }
 
-                                if !public_channels.is_empty() {
-                                    let _ = cmd_tx.send(HandlerCommand::Subscribe {
-                                        channels: public_channels,
-                                    });
-                                }
+                                drop(get_runtime().spawn(enqueue_subscription_chunks(
+                                    cmd_tx.clone(),
+                                    public_channels,
+                                    subscription_replay_chunk_size,
+                                    subscription_replay_interval,
+                                    replay_cancel.clone(),
+                                )));
                             } else {
                                 log::error!("Authentication failed: {reason}");
                             }
@@ -1809,16 +1838,43 @@ mod tests {
     use super::*;
 
     #[rstest]
-    fn reconnect_replay_respects_the_configured_chunk_size() {
+    #[tokio::test]
+    async fn reconnect_replay_respects_the_configured_chunk_size() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let channels = (0..5).map(|n| format!("channel-{n}")).collect::<Vec<_>>();
 
-        enqueue_subscription_chunks(&tx, &channels, 2);
+        enqueue_subscription_chunks(tx, channels, 2, Duration::ZERO, CancellationToken::new())
+            .await;
 
         let mut chunk_sizes = Vec::new();
         while let Ok(HandlerCommand::Subscribe { channels }) = rx.try_recv() {
             chunk_sizes.push(channels.len());
         }
         assert_eq!(chunk_sizes, [2, 2, 1]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn reconnect_replay_waits_between_chunks_and_honors_cancellation() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let channels = (0..4).map(|n| format!("channel-{n}")).collect::<Vec<_>>();
+        let cancel = CancellationToken::new();
+        let replay =
+            enqueue_subscription_chunks(tx, channels, 2, Duration::from_secs(60), cancel.clone());
+        tokio::pin!(replay);
+
+        let first = tokio::select! {
+            command = rx.recv() => command.expect("replay command channel closed"),
+            () = &mut replay => panic!("replay finished before the first command was received"),
+        };
+        let HandlerCommand::Subscribe { channels } = first else {
+            panic!("expected a subscribe command");
+        };
+        assert_eq!(channels.len(), 2);
+        assert!(rx.try_recv().is_err());
+
+        cancel.cancel();
+        replay.await;
+        assert!(rx.try_recv().is_err());
     }
 }
