@@ -352,6 +352,11 @@ pub fn parse_book_delta(
 
         let price = Price::new(price_val, price_precision);
         let size = Quantity::new(amount_val.abs(), size_precision);
+        let action = if size.is_zero() {
+            BookAction::Delete
+        } else {
+            action
+        };
 
         deltas.push(OrderBookDelta::new(
             instrument_id,
@@ -374,6 +379,11 @@ pub fn parse_book_delta(
 
         let price = Price::new(price_val, price_precision);
         let size = Quantity::new(amount_val.abs(), size_precision);
+        let action = if size.is_zero() {
+            BookAction::Delete
+        } else {
+            action
+        };
 
         deltas.push(OrderBookDelta::new(
             instrument_id,
@@ -1786,6 +1796,21 @@ mod tests {
         assert_eq!(ask_change.order.side, OrderSide::Sell);
         assert_eq!(ask_change.order.price, instrument.make_price(42501.5));
         assert_eq!(ask_change.order.size, instrument.make_qty(700.0, None));
+    }
+
+    #[rstest]
+    fn test_parse_book_delta_treats_zero_size_as_delete() {
+        let instrument = test_perpetual_instrument();
+        let json = load_test_json("ws_book_delta.json");
+        let mut response: serde_json::Value = serde_json::from_str(&json).unwrap();
+        response["params"]["data"]["bids"][0][2] = serde_json::json!(0.0);
+        let msg: DeribitBookMsg =
+            serde_json::from_value(response["params"]["data"].clone()).unwrap();
+
+        let deltas = parse_book_delta(&msg, &instrument, UnixNanos::default()).unwrap();
+
+        assert_eq!(deltas.deltas[0].action, BookAction::Delete);
+        assert!(deltas.deltas[0].order.size.is_zero());
     }
 
     #[rstest]
